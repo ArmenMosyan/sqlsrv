@@ -1,2 +1,2 @@
 # sqlsrv
-sqlsrv
+PHP library for sql server
