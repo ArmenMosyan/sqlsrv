@@ -22,7 +22,7 @@ class SQLServer
 	'UID' => null,
 	'PWD' => null,
 	'CharacterSet' => SQLSRV_ENC_CHAR,
-        //'CharacterSet' => 'UTF-8'
+	    //'CharacterSet' => 'UTF-8'
     ];
 
     /** @var resource of type(SQL Server Connection) */
@@ -44,7 +44,10 @@ class SQLServer
 
 	if ($connect_info)
 	{
-	    $this->connect_info = array_merge($this->connect_info, $connect_info);
+	    $this->connect_info = array_filter(array_merge($this->connect_info, $connect_info), function($v)
+	    {
+		return !is_null($v);
+	    });
 	}
     }
 
@@ -56,17 +59,27 @@ class SQLServer
     {
 	if (!$this->connect)
 	{
-	    if (($this->connect = sqlsrv_connect($this->server_name, $this->connect_info)) ===
-		    false)
+	    $this->connect = sqlsrv_connect($this->server_name, $this->connect_info);
+
+	    if ($this->connect === false)
 	    {
 		$error = current(sqlsrv_errors(SQLSRV_ERR_ALL));
 		throw new SQLServer\Connect\Exception($error['message'], $error['code']);
 	    }
+
 	    // Закрыть соединение по окончанию работы скрипта
 	    register_shutdown_function([$this, 'close']);
 	}
 
 	return true;
+    }
+
+    public function __get($name)
+    {
+	if (isset($this->connect_info[$name]))
+	{
+	    return $this->connect_info[$name];
+	}
     }
 
     /**
@@ -245,13 +258,49 @@ class SQLServer
     }
 
     /**
+     * Возврашает идентификато схемы.
+     * @param string $name
+     * @return string
+     */
+    public function schema_id($name = null)
+    {
+	if ($name)
+	{
+	    return $this->get_one('SELECT SCHEMA_ID(?)', [$name], 0);
+	} else
+	{
+	    return $this->get_one('SELECT SCHEMA_ID()', null, 0);
+	}
+    }
+
+    /**
+     * Возвращает название схемы.
+     * @param int $id
+     */
+    public function schema_name(int $id = null)
+    {
+	if ($id)
+	{
+	    return $this->get_one('SELECT SCHEMA_NAME(?)', [$id], 0);
+	} else
+	{
+	    return $this->get_one('SELECT SCHEMA_NAME()', null, 0);
+	}
+    }
+
+    /**
      * Возвращает идентификатор объекта из БД по его названию.
      * @param string $object_name
      * @return int
      */
-    public function object_id($object_name)
+    public function object_id($object_name, $param = null)
     {
-	return $this->get_one('SELECT OBJECT_ID(?)', [$object_name], 0);
+	if ($param)
+	{
+	    $param = ', \''.$param.'\'';
+	}
+
+	return $this->get_one('SELECT OBJECT_ID(?'.$param.')', [$object_name], 0);
     }
 
     /**
@@ -275,37 +324,85 @@ class SQLServer
     }
 
     /**
-     * Возвращает список всех хранимых процедур и их входных параметров.
-     * @return array
+     * Возвращает имя текущего пользователя.
+     *
+     * @return int - 0:CURRENT|1:SYSTEM
+     *
+     * @link https://docs.microsoft.com/ru-ru/sql/t-sql/functions/system-user-transact-sql
+     * @link https://docs.microsoft.com/ru-ru/sql/t-sql/functions/current-user-transact-sql
      */
-    public function procedures()
+    public function get_user(int $type = 1)
     {
-	/**
-	 * Запрос на получение процедур.
-	 * @var string $sql */
-	$sql = "SELECT [object_id],[create_date], [modify_date], CONCAT('[',SCHEMA_NAME([schema_id]),'].[',[name],']') [name] FROM [sys].[procedures] ORDER BY SCHEMA_NAME([schema_id]) ASC, [name] ASC";
-
-	/** @var array $procedures */
-	$procedures = $this->get_assoc_rows($sql, null, 'object_id');
-
-	if ($procedures)
+	if (in_array($type, [0, 1]))
 	{
-	    /**
-	     * Запрос на получение входных параметров.
-	     * @var string $sql
-	     */
-	    $sql = "SELECT [object_id],[parameter_id],[name],TYPE_NAME([user_type_id]) as [type],[is_readonly],[is_nullable] FROM [sys].[parameters] ORDER BY OBJECT_NAME([object_id]) ASC, [parameter_id] ASC";
-
-	    /** @var array $row*/
-	    foreach ($this->get_assoc_rows($sql) as $row)
-	    {
-		if (isset($procedures[$row['object_id']]))
-		{
-		    $procedures[$row['object_id']]['params'][$row['parameter_id']] = $row;
-		}
-	    }
+	    return $this->get_one('SELECT ' . strtoupper(['current', 'system'][$type]) . '_USER', null, 0);
 	}
 
-	return $procedures;
+	return false;
+    }
+
+    /**
+     * Проверка хранимой процедуры на существование.
+     *
+     * @param string $name
+     * @param string $schema
+     *
+     * @return boolean
+     */
+    public function proc_exists($name, $schema = null)
+    {
+	/** @var string $table */
+	$table = '[' . $this->Database . '].[sys].[procedures]';
+
+	/** @var string $schema_id */
+	if ($schema)
+	{
+	    $schema_id = $this->schema_id();
+	} else
+	{
+	    $schema_id = $this->schema_id($name);
+	}
+
+	/** @var string $sql */
+	$sql = 'SELECT IIF(EXISTS(SELECT * FROM ' . $table . ' WHERE [schema_id] = ? AND [name] = ?), 1, 0)';
+
+	return boolval((int) $this->get_one($sql, [$schema_id, $name], 0) === 1);
+    }
+
+    /**
+     * Возвращает список входных параметров хранимой процедуры.
+     *
+     * @param string $name
+     * @param string $schema
+     *
+     * @return array
+     */
+    public function proc_params($name, $schema = null)
+    {
+	/** @var string $schema_id */
+	if ($schema)
+	{
+	    $schema_id = $this->schema_id($schema);
+	} else
+	{
+	    $schema = $this->schema_name();
+	    $schema_id = $this->schema_id($schema);
+	}
+
+	/** @var string $object_id */
+	$object_id = $this->object_id($schema.'.'.$name, 'P');
+
+	/** @var string $sql */
+	$sql = 'SELECT '
+		. '[p].[parameter_id]'
+		. ',[p].[name]'
+		. ',TYPE_NAME([p].[user_type_id]) as [type]'
+		. ',[p].[is_readonly]'
+		. ',[p].[is_nullable] '
+		. 'FROM [' . $this->Database . '].[sys].[parameters] [p]'
+		. 'JOIN ['.$this->Database.'].[sys].[procedures] [ps] ON [ps].[object_id] = [p].[object_id] AND [ps].[schema_id] = ? AND [ps].[object_id] = ? '
+		. 'ORDER BY [parameter_id] ASC';
+
+	return $this->get_assoc_rows($sql, [$schema_id, $object_id], 'parameter_id');
     }
 }
